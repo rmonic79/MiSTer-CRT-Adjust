@@ -29,18 +29,17 @@
 //  The FIFO is a single-clock (clk) design with two clock-enables: it is
 //  PUSHED on pxl_cen during active video and POPPED on pxl2_cen. Because both
 //  ports live in the same clock domain there is no clock-domain crossing and
-//  no gray-code pointers are required. With DEPTH=256 the array is 256x24 =
-//  6 Kbit, which fits in LUTRAM/MLAB (ramstyle="MLAB") and frees the M10K(s)
+//  no gray-code pointers are required. With DEPTH=128 the array is 128x24 =
+//  3 Kbit, which fits in LUTRAM/MLAB (ramstyle="MLAB") and frees the M10K(s)
 //  the previous full-line buffer consumed.
 //
-//  Invariant that keeps it bounded: the reader emits exactly the same number
-//  of pixels per line that the writer pushed (the previous line's active
-//  count, latched at HSync — the active width is constant within a video
-//  mode), and the read pointer is resynced to the write pointer at every
-//  HSync. The FIFO therefore returns to empty every line and never drifts.
+//  Invariant that keeps it bounded: the reader only emits pixels the writer
+//  has already pushed THIS line (gate emit_cnt < nactive_run), and the read
+//  pointer is resynced to the write pointer at every HSync. The FIFO therefore
+//  returns to empty every line and never drifts.
 //
 //  ─── Resource cost ─────────────────────────────────────────────────────────
-//  0 M10K, ~10 MLAB + ~80 ALM, 0 DSP  (DEPTH=256).
+//  0 M10K, ~6 MLAB + ~80 ALM, 0 DSP  (DEPTH=128).
 //
 //  ─── Required external signals ─────────────────────────────────────────────
 //  pxl_cen   : the core's pixel clock enable (write rate, e.g. 6 MHz pulse
@@ -61,10 +60,14 @@
 
 module analog_hsize
 #(
-    // FIFO depth. Must exceed the peak writer-over-reader lead within a line,
-    // i.e. (max active pixels) * |hsize|max / (16 + |hsize|max). 256 covers a
-    // ~512-pixel active line at maximum stretch. Power of two.
-    parameter DEPTH = 256
+    // FIFO depth (power of two). Must exceed the peak writer-over-reader lead
+    // within a line, i.e. N * |hsize| / (16 + |hsize|) where N = active pixels.
+    // 128 covers every practical arcade mode: a 320px line at max stretch peaks
+    // at ~97, and wider lines (384px) physically can't stretch far enough to
+    // approach the limit (the stretched active must still fit the line porches,
+    // which forces a small |hsize|, hence a small peak). Raise it only for an
+    // unusually wide active region combined with aggressive stretch.
+    parameter DEPTH = 128
 )
 (
     input              clk,

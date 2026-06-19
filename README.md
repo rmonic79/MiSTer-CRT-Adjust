@@ -28,12 +28,12 @@ remains well within the tolerance of vintage 15 kHz CRTs and PVMs.
 
 The storage is a small **elastic FIFO** built from LUTRAM/MLAB, not a full-line
 M10K buffer (see [docs/theory.md](docs/theory.md) for why a whole line is not
-needed). Default `DEPTH = 256`.
+needed). Default `DEPTH = 128`.
 
 | Resource | Amount |
 |---|---|
 | M10K BRAM | 0 |
-| MLAB (LUTRAM) | ~10 |
+| MLAB (LUTRAM) | ~6 |
 | ALM | ~80 |
 | DSP | 0 |
 

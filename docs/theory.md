@@ -113,9 +113,11 @@ we only need a small FIFO sized to that peak, and the design becomes:
 Gating on the running per-line count (rather than the previous line's
 total) means the first visible line after vertical blank is handled
 correctly and the FIFO never has to hold an entire unread line — so a
-`DEPTH` of 256 comfortably covers a ~512-pixel active line at maximum
-stretch, and it fits in LUTRAM/MLAB (`ramstyle = "MLAB"`) with **zero
-M10K**.
+small `DEPTH` of 128 comfortably covers every practical arcade mode
+(a 320-pixel line peaks at ~97; wider lines can't stretch far enough to
+get near the limit, because the stretched active still has to fit inside
+the line porches). It fits in LUTRAM/MLAB (`ramstyle = "MLAB"`) with
+**zero M10K**.
 
 Both ports live in the same `clk` domain (they are just two different
 clock-enables), so there is no clock-domain crossing and no gray-code
@@ -123,5 +125,5 @@ pointer machinery — an ordinary binary read/write pointer pair is
 sufficient and safe.
 
 The simulation in `rtl/tb_analog_hsize.sv` confirms the peak-occupancy
-formula in practice (52/256 at `k = 4`, 79/256 at `k = 7`) and that the
+formula in practice (52/128 at `k = 4`, 79/128 at `k = 7`) and that the
 output is byte-exact and correctly ordered.
