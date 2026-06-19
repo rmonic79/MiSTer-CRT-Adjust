@@ -26,23 +26,47 @@ remains well within the tolerance of vintage 15 kHz CRTs and PVMs.
 
 ## Resource cost
 
+The storage is a small **elastic FIFO** built from LUTRAM/MLAB, not a full-line
+M10K buffer (see [docs/theory.md](docs/theory.md) for why a whole line is not
+needed). Default `DEPTH = 256`.
+
 | Resource | Amount |
 |---|---|
-| M10K BRAM | ~1 |
-| ALM | ~50 |
+| M10K BRAM | 0 |
+| MLAB (LUTRAM) | ~10 |
+| ALM | ~80 |
 | DSP | 0 |
+
+> Older revisions of this module used a 1024-deep ping-pong line buffer
+> (~3 M10K). The FIFO version frees those block-RAMs at the cost of a small
+> amount of logic, which is usually the better trade on a congested arcade
+> core. If you would rather spend BRAM than logic, bump `DEPTH` and let the
+> fitter place it in M10K with `ramstyle = "M10K"`.
 
 ## Repository layout
 
 ```
 MiSTer-AnalogHSize/
 ├── rtl/
-│   └── analog_hsize.sv      The standalone module
+│   ├── analog_hsize.sv      The standalone module
+│   └── tb_analog_hsize.sv   Self-checking testbench (iverilog)
 ├── docs/
 │   └── theory.md               Why and how it works
 └── examples/
     └── sys_top_snippet.v       Reference glue logic for sys_top.v
 ```
+
+### Simulating
+
+```sh
+cd rtl
+iverilog -g2012 -o /tmp/tb analog_hsize.sv tb_analog_hsize.sv && vvp /tmp/tb
+```
+
+The testbench drives bypass and two stretch factors and checks that every
+source active pixel reaches the output exactly once, in order, byte-exact,
+that the per-line count is preserved across the vertical-blank boundary, and
+that the FIFO never overflows.
 
 ---
 

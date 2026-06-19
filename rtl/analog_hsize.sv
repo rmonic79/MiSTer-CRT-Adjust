@@ -11,19 +11,36 @@
 //  per-pixel), so there is:
 //      - NO shimmering on moving content
 //      - NO blending / blur (output = source pixel, byte-exact)
-//      - NO line buffer mismatch (1-line ping-pong, deterministic phase)
-//
-//  The horizontal sync rate seen by the CRT is slightly reduced (front+back
-//  porches absorb the extra time), keeping the line within the tolerance of
-//  vintage 15 kHz CRT and PVM monitors.
+//      - NO line buffer mismatch (deterministic per-line phase)
 //
 //  The HDMI path is left COMPLETELY untouched: this module is inserted
 //  only on the analog VGA branch, after the core's video composition and
 //  before the analog DAC pins (typical insertion point in MiSTer is
 //  inside sys_top.v, before the OSD overlay).
 //
+//  ─── Storage: elastic FIFO (was: full-line ping-pong) ───────────────────────
+//  The read side is slower than the write side by an integer ratio
+//  (16+|hsize|)/16, so within an active line the writer leads the reader by
+//  at most  N * |hsize| / (16+|hsize|)  pixels (N = active pixels per line).
+//  For a 320-pixel line at the maximum stretch that is ~100 pixels — far less
+//  than a whole line. We therefore only need a small elastic FIFO sized to
+//  that peak lead instead of a full 1024-deep ping-pong line buffer.
+//
+//  The FIFO is a single-clock (clk) design with two clock-enables: it is
+//  PUSHED on pxl_cen during active video and POPPED on pxl2_cen. Because both
+//  ports live in the same clock domain there is no clock-domain crossing and
+//  no gray-code pointers are required. With DEPTH=256 the array is 256x24 =
+//  6 Kbit, which fits in LUTRAM/MLAB (ramstyle="MLAB") and frees the M10K(s)
+//  the previous full-line buffer consumed.
+//
+//  Invariant that keeps it bounded: the reader emits exactly the same number
+//  of pixels per line that the writer pushed (the previous line's active
+//  count, latched at HSync — the active width is constant within a video
+//  mode), and the read pointer is resynced to the write pointer at every
+//  HSync. The FIFO therefore returns to empty every line and never drifts.
+//
 //  ─── Resource cost ─────────────────────────────────────────────────────────
-//  ~1 M10K (24-bit linebuffer with ping-pong banks), ~50 ALM, 0 DSP.
+//  0 M10K, ~10 MLAB + ~80 ALM, 0 DSP  (DEPTH=256).
 //
 //  ─── Required external signals ─────────────────────────────────────────────
 //  pxl_cen   : the core's pixel clock enable (write rate, e.g. 6 MHz pulse
@@ -43,6 +60,12 @@
 //============================================================================
 
 module analog_hsize
+#(
+    // FIFO depth. Must exceed the peak writer-over-reader lead within a line,
+    // i.e. (max active pixels) * |hsize|max / (16 + |hsize|max). 256 covers a
+    // ~512-pixel active line at maximum stretch. Power of two.
+    parameter DEPTH = 256
+)
 (
     input              clk,
     input              pxl_cen,      // write clock enable (core pixel rate)
@@ -67,10 +90,12 @@ module analog_hsize
     output reg         vb_out
 );
 
-    localparam integer AW = 10;  // 1024 samples per line (ping-pong banks)
+    localparam integer LAW = $clog2(DEPTH);   // FIFO pointer width
+    localparam integer CW  = 12;              // active-pixel counter width (>= line width)
 
     // ------------------------------------------------------------------
-    //  Input pipeline @ pxl_cen (for latency matching in bypass mode)
+    //  Input pipeline @ pxl_cen (for latency matching in bypass mode and
+    //  for passing the regenerated sync/blank flags in stretch mode).
     // ------------------------------------------------------------------
     reg [7:0] r_in_q, g_in_q, b_in_q;
     reg       hs_in_q, hb_in_q, vs_in_q, vb_in_q;
@@ -95,101 +120,92 @@ module analog_hsize
     wire hs_rise_in = pxl_cen && (hs_in & ~hs_in_d);
 
     // ------------------------------------------------------------------
-    //  Linebuffer ping-pong (24-bit RGB, single M10K, two banks).
-    //  Written @ pxl_cen by the core, read @ pxl2_cen by the DAC.
-    //  Two banks (selected by `bank` flipped on each HSync rise) avoid
-    //  read/write collisions: write current line into `bank`, read the
-    //  previous line (`~bank`) which is already complete.
+    //  HSync rising edge detected at FULL clk rate, latched until the next
+    //  pxl2_cen pulse consumes it. This avoids missing the edge when
+    //  pxl2_cen is slow, and locks the per-line read phase deterministically.
     // ------------------------------------------------------------------
-    (* ramstyle = "no_rw_check, M10K" *) reg [23:0] mem [0:(1<<AW)-1];
-    integer ii;
-    initial for (ii = 0; ii < (1<<AW); ii = ii + 1) mem[ii] = 24'd0;
-
-    // ------------------------------------------------------------------
-    //  WRITE side @ pxl_cen
-    // ------------------------------------------------------------------
-    reg [AW-1:0] wrp;
-    reg [AW-1:0] hmax;
-    reg [AW-1:0] hb0, hb1;
-    reg          lhb_l;
-    reg          bank;
+    reg hs_in_d2;
+    reg hs_rise_pending;
     initial begin
-        wrp = 0; hmax = 0;
-        hb0 = 0; hb1 = 0;
-        lhb_l = 0;
-        bank = 0;
-    end
-
-    wire lhb = ~hb_in;
-
-    always @(posedge clk) if (pxl_cen) begin
-        lhb_l <= lhb;
-        mem[{bank, wrp[AW-2:0]}] <= {r_in, g_in, b_in};
-        if (hs_rise_in) begin
-            wrp  <= {AW{1'b0}};
-            hmax <= wrp;
-            bank <= ~bank;
-        end else begin
-            wrp <= wrp + 1'b1;
-        end
-        if (lhb   & ~lhb_l) hb1 <= wrp;  // start of active region (wrp value)
-        if (~lhb  &  lhb_l) hb0 <= wrp;  // end of active region   (wrp value)
-    end
-
-    // ------------------------------------------------------------------
-    //  READ side @ pxl2_cen.
-    //  rdcnt increments by 1 at each pxl2_cen pulse -> exactly one source
-    //  pixel is emitted to the DAC per read tick. Reset is triggered by
-    //  the rising edge of HSync, detected at FULL clk rate to avoid
-    //  missing edges when pxl2_cen is slow.
-    // ------------------------------------------------------------------
-    reg [AW-1:0] rdcnt;
-    reg          hs_in_d2;
-    reg          hs_rise_pending;
-    initial begin
-        rdcnt = 0;
-        hs_in_d2 = 0;
+        hs_in_d2        = 0;
         hs_rise_pending = 0;
     end
-
     always @(posedge clk) begin
         hs_in_d2 <= hs_in;
-        if (hs_in & ~hs_in_d2)        hs_rise_pending <= 1'b1;
-        else if (pxl2_cen)            hs_rise_pending <= 1'b0;
+        if (hs_in & ~hs_in_d2)  hs_rise_pending <= 1'b1;
+        else if (pxl2_cen)      hs_rise_pending <= 1'b0;
     end
+
+    // ------------------------------------------------------------------
+    //  Elastic FIFO storage (single clk domain, two clock enables).
+    //  PUSH @ pxl_cen during active video, POP @ pxl2_cen.
+    // ------------------------------------------------------------------
+    (* ramstyle = "MLAB, no_rw_check" *) reg [23:0] mem [0:DEPTH-1];
+    integer ii;
+    initial for (ii = 0; ii < DEPTH; ii = ii + 1) mem[ii] = 24'd0;
+
+    reg [LAW-1:0] wptr, rptr;
+    reg [CW-1:0]  nactive_run;   // active pixels pushed so far in the current line
+    initial begin
+        wptr = 0; rptr = 0;
+        nactive_run = 0;
+    end
+
+    wire active_in = ~hb_in & ~vb_in;          // source pixel is visible
+    wire push      = pxl_cen & active_in;
+    wire empty     = (wptr == rptr);
+
+    // WRITE side @ pxl_cen. hs_rise_in (during sync) and push (during active)
+    // are mutually exclusive, so the per-line reset and the push never collide.
+    always @(posedge clk) if (pxl_cen) begin
+        if (hs_rise_in) nactive_run <= {CW{1'b0}};
+        if (push) begin
+            mem[wptr]   <= {r_in, g_in, b_in};
+            wptr        <= wptr + 1'b1;
+            nactive_run <= nactive_run + 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    //  READ side @ pxl2_cen. Emit pixels as the writer makes them available
+    //  (gate on emit_cnt < nactive_run, the count pushed SO FAR this line),
+    //  which self-paces with no dependence on the previous line — so the
+    //  first visible line after vertical blank is handled correctly and the
+    //  FIFO never has to hold a whole unread line. Resync rptr to wptr on
+    //  each HSync so the FIFO can never drift across lines.
+    // ------------------------------------------------------------------
+    reg [CW-1:0] emit_cnt;
+    reg [23:0]   rd_data;
+    reg          out_act_d;   // a pixel was popped on the previous pxl2_cen tick;
+                              // aligned with rd_data as seen by the output block
+                              // (which reads rd_data with one tick of NB delay).
+    initial begin
+        emit_cnt = 0; rd_data = 0; out_act_d = 0;
+    end
+
+    wire pop = pxl2_cen & ~hs_rise_pending & (emit_cnt < nactive_run) & ~empty;
 
     always @(posedge clk) if (pxl2_cen) begin
         if (hs_rise_pending) begin
-            rdcnt <= {AW{1'b0}};
+            rptr      <= wptr;                 // resync: drop any (already-emitted) tail
+            emit_cnt  <= {CW{1'b0}};
+            out_act_d <= 1'b0;
+        end else if (pop) begin
+            rd_data   <= mem[rptr];
+            rptr      <= rptr + 1'b1;
+            emit_cnt  <= emit_cnt + 1'b1;
+            out_act_d <= 1'b1;
         end else begin
-            rdcnt <= rdcnt + 1'b1;
+            out_act_d <= 1'b0;
         end
     end
 
     // ------------------------------------------------------------------
-    //  Read from the linebuffer @ pxl2_cen, on the OPPOSITE bank to the
-    //  one currently being written (so the previous fully-written line).
-    //  pass_q gates active video against blanking, in linebuffer units.
-    // ------------------------------------------------------------------
-    reg [23:0] rd_data;
-    reg        pass_q;
-    initial begin
-        rd_data = 0;
-        pass_q = 0;
-    end
-
-    always @(posedge clk) if (pxl2_cen) begin
-        rd_data <= mem[{~bank, rdcnt[AW-2:0]}];
-        pass_q  <= (rdcnt >= hb1) && (rdcnt < hb0);
-    end
-
-    // ------------------------------------------------------------------
-    //  Output mux. CRITICAL: when stretch is active, outputs MUST be
-    //  registered @ pxl2_cen (the DAC rate), NOT @ pxl_cen (the write
-    //  rate). Otherwise the fast write clock would re-sample the slow
-    //  read data at write rate, breaking the "every pixel lasts exactly
-    //  (16+hsize) clk cycles" property and re-introducing shimmering.
-    //  In bypass mode, registers run at pxl_cen for full passthrough.
+    //  Output mux. When stretch is active, outputs MUST be registered
+    //  @ pxl2_cen (the DAC rate), NOT @ pxl_cen (the write rate), otherwise
+    //  the fast write clock would re-sample the slow read data and break the
+    //  "every pixel lasts exactly (16+hsize) clk cycles" property.
+    //  In bypass mode the registers run at pxl_cen for full passthrough.
     // ------------------------------------------------------------------
     wire bypass = (hsize == 4'sd0);
 
@@ -211,7 +227,7 @@ module analog_hsize
             end
         end else begin
             if (pxl2_cen) begin
-                if (pass_q) begin
+                if (out_act_d) begin
                     r_out <= rd_data[23:16];
                     g_out <= rd_data[15:8];
                     b_out <= rd_data[7:0];
@@ -220,7 +236,7 @@ module analog_hsize
                     g_out <= 8'd0;
                     b_out <= 8'd0;
                 end
-                hb_out <= ~pass_q;
+                hb_out <= ~out_act_d;
                 hs_out <= hs_in_q;
                 vs_out <= vs_in_q;
                 vb_out <= vb_in_q;
