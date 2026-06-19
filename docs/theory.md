@@ -82,5 +82,48 @@ trembling. Resetting it on HSync locks the phase, and from there
 each scan line starts in exactly the same place.
 
 These two details are what make the module produce a clean,
-uniform widening of the analog image. The rest of the design is a
-straightforward ping-pong line buffer.
+uniform widening of the analog image.
+
+## Storage: a small elastic FIFO, not a whole line
+
+The original design kept a full-line ping-pong buffer (two 1024-deep
+banks of 24-bit RGB), which costs ~3 M10K block-RAMs. That is more
+than is actually needed.
+
+Because the read side is slower than the write side by the integer
+ratio `(16+k)/16`, within one active line the writer can only get
+*so far* ahead of the reader. With `N` active pixels per line the
+maximum lead is
+
+```
+peak_occupancy = N * k / (16 + k)
+```
+
+For a 320-pixel line at maximum stretch (`k = 7`) that is about 97
+pixels — roughly a tenth of a line. So instead of a whole-line buffer
+we only need a small FIFO sized to that peak, and the design becomes:
+
+- **Push** one RGB sample into the FIFO on each `pxl_cen` during active
+  video.
+- **Pop** one sample on each `pxl2_cen`, gated so the reader never runs
+  ahead of what has been pushed *this line* (`emit_cnt < nactive_run`).
+- **Resync** the read pointer to the write pointer on every rising
+  HSync, so the FIFO returns to empty each line and can never drift.
+
+Gating on the running per-line count (rather than the previous line's
+total) means the first visible line after vertical blank is handled
+correctly and the FIFO never has to hold an entire unread line — so a
+small `DEPTH` of 128 comfortably covers every practical arcade mode
+(a 320-pixel line peaks at ~97; wider lines can't stretch far enough to
+get near the limit, because the stretched active still has to fit inside
+the line porches). It fits in LUTRAM/MLAB (`ramstyle = "MLAB"`) with
+**zero M10K**.
+
+Both ports live in the same `clk` domain (they are just two different
+clock-enables), so there is no clock-domain crossing and no gray-code
+pointer machinery — an ordinary binary read/write pointer pair is
+sufficient and safe.
+
+The simulation in `rtl/tb_analog_hsize.sv` confirms the peak-occupancy
+formula in practice (52/128 at `k = 4`, 79/128 at `k = 7`) and that the
+output is byte-exact and correctly ordered.
