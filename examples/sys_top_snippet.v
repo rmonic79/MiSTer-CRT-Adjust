@@ -11,24 +11,50 @@
 
 // ─── 1. Generate the read-side clock enable ────────────────────────────────
 //
-// Counter modulo (16 + hsize_emu) on clk_vid, reset on rising HSync for
+// The read pixel must last (base + hsize_emu) clk_vid cycles, where `base` is
+// the core's NATIVE clk_vid-per-pixel period (i.e. how many clk_vid ticks
+// elapse between two vga_ce_sl pulses). Each +1 of the OSD then adds exactly
+// one clk_vid per pixel, a small uniform step.
+//
+// IMPORTANT: do NOT hardcode base = 16. It is core-specific:
+//     base = clk_vid_freq / pixel_clock
+//   e.g. a JTFRAME core with clk_vid = 48 MHz and a 6 MHz pixel clock has
+//   base = 8, so a hardcoded 16 would make even "+1" roughly DOUBLE the image
+//   (17/8 ≈ 2.1×) instead of the intended ~1.12×.
+//
+// To stay correct on any core we MEASURE the base at run time by counting
+// clk_vid cycles between vga_ce_sl pulses. (If you prefer, replace vga_base
+// with a constant equal to your core's clk_vid/pixel ratio and drop the
+// measuring block.)
+
+reg  [5:0] vga_base = 6'd16;   // auto-measured clk_vid-per-pixel period
+reg  [5:0] vga_pcnt = 6'd0;
+always @(posedge clk_vid) begin
+    if (vga_ce_sl) begin
+        vga_base <= vga_pcnt + 6'd1;
+        vga_pcnt <= 6'd0;
+    end else begin
+        vga_pcnt <= vga_pcnt + 6'd1;
+    end
+end
+
+// Counter modulo (base + hsize_emu) on clk_vid, reset on rising HSync for
 // deterministic per-line phase. This is what guarantees uniform stretch
 // without trembling.
-
 reg vga_hs_sl_d;
 always @(posedge clk_vid) vga_hs_sl_d <= vga_hs_sl;
 wire vga_hs_rise = vga_hs_sl & ~vga_hs_sl_d;
 
-reg  [4:0] vga_ce_div;
-wire [4:0] vga_ce_max = 5'd15 + {2'd0, hsize_emu};
+reg  [5:0] vga_ce_div;
+wire [5:0] vga_ce_max = vga_base - 6'd1 + {3'd0, hsize_emu};
 always @(posedge clk_vid) begin
-    if      (vga_hs_rise)              vga_ce_div <= 5'd0;
-    else if (vga_ce_div == vga_ce_max) vga_ce_div <= 5'd0;
-    else                                vga_ce_div <= vga_ce_div + 5'd1;
+    if      (vga_hs_rise)               vga_ce_div <= 6'd0;
+    else if (vga_ce_div >= vga_ce_max)  vga_ce_div <= 6'd0;
+    else                                vga_ce_div <= vga_ce_div + 6'd1;
 end
 
 // When hsize_emu == 0 we want true bypass at write rate.
-wire vga_ce_sl2 = (hsize_emu == 3'd0) ? vga_ce_sl : (vga_ce_div == 5'd0);
+wire vga_ce_sl2 = (hsize_emu == 3'd0) ? vga_ce_sl : (vga_ce_div == 6'd0);
 
 
 // ─── 2. Sign-convert the OSD value ─────────────────────────────────────────
