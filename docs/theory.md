@@ -1,5 +1,15 @@
 # How and why it works
 
+> This document explains the stretch engine itself. It uses `16` throughout as
+> the clock-to-pixel divisor, which is the value for a DEC0-style core
+> (`clk_video` 96 MHz / 6 MHz pixel = 16). That number is **not universal**:
+> the general form is `base = clk_video / pixel`, and the read divider is
+> `base + hsize`. Size it from your own clock ratio.
+>
+> This same engine can be integrated two ways — inside `sys_top.v` (HDMI stays
+> bit-identical) or entirely core-side (no framework edits). For the core-side
+> variant see [emu-side-integration.md](emu-side-integration.md).
+
 ## The problem
 
 Arcade cores on MiSTer produce a fixed-resolution pixel stream

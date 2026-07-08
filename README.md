@@ -16,13 +16,46 @@ a perfectly uniform widening of the image:
   to the source pixel).
 - **No duplicated pixels** (each source pixel maps to exactly one
   DAC pixel, just held for a longer time).
-- **HDMI output is untouched** — the module sits only on the analog
-  branch, after the core's video composition and before the analog
-  DAC pins.
 
 The trade-off is a slightly lower analog horizontal sync rate (the
 extra time is absorbed by shortened front and back porches), which
 remains well within the tolerance of vintage 15 kHz CRTs and PVMs.
+
+## Why two integration paths
+
+The module was first written as a **sys-side** insertion: the stretch sits on
+the analog DAC branch *inside* `sys_top.v`, so HDMI (which taps the stream
+above that point) stays bit-identical. That is the cleanest result — but it
+means editing `sys/sys_top.v`, which is framework code vendored from the
+MiSTer template. Sorgelig does not accept that change upstream, and many
+project rules forbid touching `sys/` at all (it gets clobbered on template
+updates). So a core that must stay framework-clean cannot ship the sys-side
+version.
+
+That is why the **emu-side** variant exists: it runs the same stretch engine
+entirely inside the core's `emu` wrapper, at the video-output boundary, with
+**zero `sys_top.v` edits**. The core hands `sys_top` an already-stretched
+stream. The catch is that this stream also reaches the HDMI scaler, so on
+emu-side HDMI is **not** bit-identical — it follows the stretch (a fair
+trade-off for a CRT/analog feature; leave it Off for untouched HDMI). Getting
+the OSD to survive this required a specific fix on the vertical-blank input —
+see [Acknowledgements](#acknowledgements).
+
+Pick by whether you may edit `sys/sys_top.v` and whether HDMI must stay
+untouched:
+
+| | **sys-side** (`analog_hsize.sv`) | **emu-side** (`analog_hsize_emu.sv`) |
+|---|---|---|
+| Where | DAC stage inside `sys_top.v` | core's video-output boundary (`emu`) |
+| Framework edits | yes (small, local to your repo) | **none** — `sys_top` untouched |
+| HDMI | **bit-identical** (untouched) | follows the stretch (analog/CRT feature) |
+| Best when | you can edit `sys_top` | `sys_top` is off-limits / vendored |
+
+- **sys-side**: cleanest, HDMI stays exactly the same. See the guide below and
+  [`examples/sys_top_snippet.v`](examples/sys_top_snippet.v).
+- **emu-side**: zero framework edits. See
+  [`docs/emu-side-integration.md`](docs/emu-side-integration.md) and
+  [`examples/emu_side_snippet.v`](examples/emu_side_snippet.v).
 
 ## Resource cost
 
@@ -37,20 +70,25 @@ remains well within the tolerance of vintage 15 kHz CRTs and PVMs.
 ```
 MiSTer-AnalogHSize/
 ├── rtl/
-│   └── analog_hsize.sv      The standalone module
+│   ├── analog_hsize.sv         The module — sys-side variant
+│   └── analog_hsize_emu.sv     The module — emu-side variant (vb_in fix)
 ├── docs/
-│   └── theory.md               Why and how it works
+│   ├── theory.md               Why and how it works
+│   └── emu-side-integration.md Core-side integration (no sys_top edits)
 └── examples/
-    └── sys_top_snippet.v       Reference glue logic for sys_top.v
+    ├── sys_top_snippet.v       Reference glue for sys-side (sys_top.v)
+    └── emu_side_snippet.v      Reference glue for emu-side (core .sv)
 ```
 
 ---
 
 # Integration into a MiSTer arcade core
 
-This guide walks through adding `analog_hsize.sv` to an existing
-MiSTer arcade core. The integration is done entirely on the analog VGA
-path inside `sys_top.v`; the HDMI scaler path is not modified.
+This guide covers the **sys-side** integration (`analog_hsize.sv`). It is done
+entirely on the analog VGA path inside `sys_top.v`; on this path the HDMI scaler
+path is not modified, so HDMI stays bit-identical. (For the emu-side variant,
+which touches no framework code but does let the stretch reach HDMI, see
+[`docs/emu-side-integration.md`](docs/emu-side-integration.md).)
 
 > **Heads up**: this integration involves editing `sys/sys_top.v`,
 > which is a file from the upstream MiSTer framework. The edits are
@@ -189,7 +227,8 @@ stream.
 Rebuild the core. With H-Size = 0 the analog output should be
 bit-identical to the original (the module is in bypass mode). At
 higher values the image gradually widens on the analog VGA output
-while HDMI stays exactly the same.
+while HDMI stays exactly the same (this HDMI-untouched property is
+specific to the sys-side insertion described here).
 
 If you see **trembling that drifts frame-to-frame**, the counter
 reset on HSync is not wired correctly (step 3). If you see **moving
@@ -197,6 +236,121 @@ shimmer on scrolling content**, the outputs are being registered at
 the wrong rate inside the module — verify that the build is using
 the up-to-date `analog_hsize.sv` and that no other code is
 re-clocking the outputs at the write rate after the module.
+
+---
+
+# Integration into a MiSTer arcade core (emu-side)
+
+This is the **emu-side** integration (`analog_hsize_emu.sv`). The module runs
+entirely inside the core's `emu` wrapper, at the video-output boundary, with
+**zero `sys/sys_top.v` edits** — use this when the framework is off-limits or
+vendored. The trade-off vs the sys-side path above: the stretched stream also
+reaches the HDMI scaler, so **HDMI is not bit-identical — it follows the
+stretch** (treat it as an analog/CRT feature; leave H-Size Off for untouched
+HDMI). The full rationale and the non-obvious gotchas are in
+[`docs/emu-side-integration.md`](docs/emu-side-integration.md); the complete
+glue is in [`examples/emu_side_snippet.v`](examples/emu_side_snippet.v). The
+steps below are the summary.
+
+## 1. Add the module to the project
+
+Copy `rtl/analog_hsize_emu.sv` into your core's RTL (e.g. `rtl/`) and add it
+to your `.qip` / `.qsf`:
+
+```tcl
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/analog_hsize_emu.sv
+```
+
+Nothing goes into `sys/` and nothing in `sys_top.v` changes.
+
+## 2. Expose the OSD option
+
+In your top-level `.sv` `CONF_STR`, add an On/Off toggle plus an amount
+(`H<n>` hides the amount until it is On; put `H` before `P`):
+
+```verilog
+"P1O[101],CRT Stretch,Off,On;",
+"H1P1O[100:98],CRT Stretch Amount,0,1,2,3,4,5;",
+```
+
+and drive the menumask so the amount is hidden while off:
+
+```verilog
+.status_menumask({14'd0, ~status[101], 1'b0}),
+...
+wire [2:0] hsize = status[101] ? status[100:98] : 3'd0;   // 0 = bypass
+```
+
+## 3. Generate the read clock-enable
+
+The read rate (`pxl2_cen`) is slower than the write rate (`pxl_cen`) by an
+integer divisor `base + hsize` of the video clock, where
+`base = clk_video / pixel` (16 on a 96 MHz / 6 MHz DEC0 core — **size it from
+your own ratio**). Reset the counter on the HSync rising edge so every line
+starts in a deterministic phase:
+
+```verilog
+reg  vga_hs_d;
+always @(posedge clk_sys) vga_hs_d <= hs;
+wire hs_rise = hs & ~vga_hs_d;
+
+reg  [4:0] rd_div;
+wire [4:0] rd_max = 5'd15 + {2'd0, hsize};   // 15 = base-1
+always @(posedge clk_sys)
+    if (hs_rise || rd_div == rd_max) rd_div <= 5'd0;
+    else                             rd_div <= rd_div + 5'd1;
+
+wire              rd_ce   = (hsize == 3'd0) ? ce_pix : (rd_div == 5'd0);
+wire signed [3:0] hsize_s = -$signed({1'b0, hsize});   // module: <0 = wider
+```
+
+## 4. Instantiate the module — note `hb_in` vs `vb_in`
+
+Feed the module the core's composed RGB (e.g. after your OSD/pause overlay).
+The critical detail: `hb_in` gets the **combined** blank (`hb | vb`), but
+`vb_in` gets the **TRUE vertical blank** (`vb`) — this is what lets the
+downstream OSD find the vertical frame boundary while the horizontal window
+still widens (see the doc, "the `vb_in` fix").
+
+```verilog
+analog_hsize_emu u_analog_hsize_emu (
+    .clk(clk_sys), .pxl_cen(ce_pix), .pxl2_cen(rd_ce), .hsize(hsize_s),
+    .r_in(av_r), .g_in(av_g), .b_in(av_b),
+    .hs_in(hs), .vs_in(vs),
+    .hb_in(hb | vb),   // combined blank on the horizontal edges
+    .vb_in(vb),        // TRUE vertical blank -> OSD stays visible
+    .r_out(str_r), .g_out(str_g), .b_out(str_b),
+    .hs_out(str_hs), .vs_out(str_vs), .hb_out(str_hb), .vb_out(str_vb)
+);
+```
+
+## 5. Drive the emu outputs and keep the OSD put
+
+Mux the module outputs onto `VGA_*` when the stretch is active, and set
+`CE_PIXEL = rd_ce`. To stop the OSD sliding when H-Shift moves the image,
+build a `de_osd` window whose **rising is anchored to the native active
+region** and feed it to `video_freak`'s `VGA_DE_IN`. See
+[`examples/emu_side_snippet.v`](examples/emu_side_snippet.v) for the exact
+wiring (H-Shift/V-Shift applied upstream, `de_osd`, bypass handling).
+
+## 6. Rebuild and test
+
+With CRT Stretch Off the output is bit-identical (bypass). At higher amounts
+the analog image widens; HDMI follows the stretch too (expected for this
+path). Same trembling/shimmer troubleshooting as the sys-side guide applies.
+
+---
+
+## Acknowledgements
+
+- **Andrea Bogazzi** ([@asturur](https://github.com/asturur)) — diagnosed the
+  **`vb_in` gotcha** while integrating this module core-side into a Deco16 /
+  Caveman Ninja JTFRAME core. Feeding the *combined* blank into `vb_in`
+  re-clamps the output window to the original width (the image looks stretched
+  but clipped at the old right edge). His insight is what made the emu-side
+  variant keep a working OSD: `analog_hsize_emu.sv` passes the **true** vertical
+  blank and gates only `pass_q`, never the horizontal edges. He also wrote the
+  elastic-FIFO and the auto-measured base fixes on the module.
 
 ---
 

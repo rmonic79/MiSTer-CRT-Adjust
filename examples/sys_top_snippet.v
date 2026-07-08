@@ -5,7 +5,8 @@
 //  core's sys_top.v. This is NOT a complete file — only the relevant
 //  fragments that need to be added or modified are shown.
 //
-//  See ../docs/integration.md for the full step-by-step procedure.
+//  See the README ("Integration into a MiSTer arcade core") for the full
+//  step-by-step procedure, and ../docs/theory.md for how the stretch works.
 //============================================================================
 
 
