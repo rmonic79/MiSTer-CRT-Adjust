@@ -143,25 +143,53 @@ If your `sys_top.v` does not yet wire `VGA_HSIZE` into `emu`, add
 the line above (the port already exists on the framework side).
 
 The read rate (`pxl2_cen`) must be slower than the write rate
-(`pxl_cen`) by an integer divisor `(16 + hsize)` of `clk_vid`. The
-counter must reset on the rising edge of HSync so that every line
-starts in a deterministic phase (this is what eliminates the
+(`pxl_cen`): the read pixel lasts `(base + hsize)` cycles of `clk_vid`,
+where **`base` is the core's native `clk_vid`-per-pixel period** — the
+number of `clk_vid` ticks between two `vga_ce_sl` pulses:
+
+```
+base = clk_vid_freq / pixel_clock
+```
+
+> ⚠️ **Do not hardcode `base = 16`.** It is core-specific. For example a
+> JTFRAME core with `clk_vid = 48 MHz` and a 6 MHz pixel clock has
+> `base = 8`, so a hardcoded 16 makes even **+1** roughly *double* the
+> image (`17/8 ≈ 2.1×`) instead of the intended `9/8 ≈ 1.12×`. This is
+> the single most common integration mistake.
+
+The counter must also reset on the rising edge of HSync so that every
+line starts in a deterministic phase (this is what eliminates the
 frame-to-frame "trembling" you would otherwise see).
 
+To stay correct on **any** core, measure `base` at run time by counting
+`clk_vid` cycles between `vga_ce_sl` pulses:
+
 ```verilog
+// Auto-measure the core's native clk_vid-per-pixel period.
+reg  [5:0] vga_base = 6'd16;
+reg  [5:0] vga_pcnt = 6'd0;
+always @(posedge clk_vid) begin
+    if (vga_ce_sl) begin vga_base <= vga_pcnt + 6'd1; vga_pcnt <= 6'd0; end
+    else                 vga_pcnt <= vga_pcnt + 6'd1;
+end
+
 reg vga_hs_sl_d;
 always @(posedge clk_vid) vga_hs_sl_d <= vga_hs_sl;
 wire vga_hs_rise = vga_hs_sl & ~vga_hs_sl_d;
 
-reg  [4:0] vga_ce_div;
-wire [4:0] vga_ce_max = 5'd15 + {2'd0, hsize_emu};
+reg  [5:0] vga_ce_div;
+wire [5:0] vga_ce_max = vga_base - 6'd1 + {3'd0, hsize_emu};
 always @(posedge clk_vid) begin
-    if      (vga_hs_rise)              vga_ce_div <= 5'd0;
-    else if (vga_ce_div == vga_ce_max) vga_ce_div <= 5'd0;
-    else                                vga_ce_div <= vga_ce_div + 5'd1;
+    if      (vga_hs_rise)               vga_ce_div <= 6'd0;
+    else if (vga_ce_div >= vga_ce_max)  vga_ce_div <= 6'd0;
+    else                                vga_ce_div <= vga_ce_div + 6'd1;
 end
-wire vga_ce_sl2 = (hsize_emu == 3'd0) ? vga_ce_sl : (vga_ce_div == 5'd0);
+wire vga_ce_sl2 = (hsize_emu == 3'd0) ? vga_ce_sl : (vga_ce_div == 6'd0);
 ```
+
+(If you'd rather keep it simple, replace `vga_base` with a constant equal
+to your core's `clk_vid/pixel` ratio and drop the measuring block — e.g.
+`localparam [5:0] vga_base = 6'd8;` for the 48 MHz / 6 MHz case.)
 
 `hsize_emu` is the 3-bit unsigned value coming from the OSD (the
 `VGA_HSIZE` port). The module input is signed and the convention is
