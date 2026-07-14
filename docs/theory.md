@@ -1,14 +1,19 @@
 # How and why it works
 
-> This document explains the stretch engine itself. It uses `16` throughout as
-> the clock-to-pixel divisor, which is the value for a DEC0-style core
-> (`clk_video` 96 MHz / 6 MHz pixel = 16). That number is **not universal**:
-> the general form is `base = clk_video / pixel`, and the read divider is
-> `base + hsize`. Size it from your own clock ratio.
+> This document explains the **CRT Adjust** engine. The module exposes three
+> controls — **H-Size**, **H-Position** and **V-Shift** — from one line buffer.
+> The common principle behind all three: **the picture *content* is
+> shifted/resized, the sync signals stay native.** That is why the CRT never
+> loses lock, no matter how far you push a control. The sections below explain
+> each in turn, starting with H-Size (the original engine).
 >
-> This same engine can be integrated two ways — inside `sys_top.v` (HDMI stays
+> Numbers here use a DEC0-style core (`clk_video` 96 MHz / 6 MHz pixel), where
+> one pixel = 16 clock cycles. That ratio is **not universal**: the general
+> form is `base = clk_video / pixel`. Size everything from your own ratio.
+>
+> The same engine integrates two ways — inside `sys_top.v` (HDMI stays
 > bit-identical) or entirely core-side (no framework edits). For the core-side
-> variant see [emu-side-integration.md](emu-side-integration.md).
+> variant see [core-side-integration.md](core-side-integration.md).
 
 ## The problem
 
@@ -37,19 +42,24 @@ of three artifacts:
 
 This module avoids all three by working in a fourth, cleaner way.
 
-## The trick: slow the read clock, keep the rate integer
+## H-Size — the trick: change the read rate, keep the hold uniform
 
 The line buffer is written at the **core's pixel rate** (one source
-pixel per `pxl_cen` pulse). The DAC reads it at a **slower rate**
-(`pxl2_cen`), and `pxl2_cen` is generated as an integer divisor
-`16 + hsize` of the system clock. Because the divisor is integer,
-**every** DAC pixel lasts exactly the same `16 + hsize` clock cycles
-— no pixel is repeated, no pixel is fractional, no pixel is skipped.
+pixel per `pxl_cen` pulse). The DAC reads it at a **different rate**
+(`pxl2_cen`): read *slower* than you wrote and each pixel lasts longer
+→ the image **widens**; read *faster* and it **narrows**. H-Size is
+therefore bidirectional (stretch *and* squeeze), unlike the original
+widen-only module.
 
-That means every source pixel is shown on the DAC for *the same
-amount of extra time*, and there is therefore no shimmering: the
-sampling is uniform along the line and stays uniform from frame to
-frame because the counter resets on each rising HSync.
+The read rate is stepped in **quarter cycles** through a small
+accumulator, not in whole-cycle divisor steps. On a `base = 64`
+quarters (= 16 whole cycles) core the period is `64 + hsize` quarters,
+so each H-Size step is one quarter cycle ≈ **1.5 %** — fine enough to
+land the width exactly where you want it, instead of the coarse jumps
+a whole-cycle divisor gives you. The hold time is still uniform for
+every pixel on the line, so there is **no shimmering**: the sampling is
+uniform along the line and stays uniform frame to frame because the
+accumulator resets on each rising **native** HSync.
 
 Mathematically, with `hsize = k` (k = 0..7) and a 96 MHz `clk_vid`:
 
@@ -92,5 +102,48 @@ trembling. Resetting it on HSync locks the phase, and from there
 each scan line starts in exactly the same place.
 
 These two details are what make the module produce a clean,
-uniform widening of the analog image. The rest of the design is a
-straightforward ping-pong line buffer.
+uniform resizing of the analog image. The rest of the H-Size design
+is a straightforward ping-pong line buffer.
+
+## H-Position — shift the content, not the sync
+
+H-Position slides the picture left/right. The naive way — moving the
+blanking/sync window — makes a CRT drop horizontal lock once you push
+it far enough. This module does it the safe way: it offsets only the
+**read address** into the line buffer,
+
+```
+rd_addr = rdcnt - hoffset
+```
+
+and shifts the active-window compare (`pass_q`) by the same `hoffset`.
+The visible content moves; **`hs_out` is never touched**, so it stays
+byte-for-byte the native HSync. The CRT sees an unchanged sync and a
+moved picture → the image slides with **no horizontal desync at any
+offset**. Positive `hoffset` moves right, negative moves left.
+
+## V-Shift — delay the sync a few lines
+
+V-Shift moves the picture up/down. Vertically a CRT has plenty of
+tolerance, so here it is fine to move the sync itself — by a few whole
+lines. A per-line shift register captures `vs_in` once per line (on the
+native HSync edge) and taps it `|voffset|` lines back (or forward),
+producing a `VSync` delayed/advanced by N lines:
+
+```
+vsync_line_shreg <= {vsync_line_shreg[VTOTAL-2:0], vs_in};   // once per line
+vs_shifted       <= vsync_line_shreg[vshift_tap - 1];
+```
+
+`VTOTAL` (total lines per frame) sizes the shift register. The picture
+content is untouched; only the vertical sync position changes, which
+the monitor absorbs → **no vertical desync**. Positive moves down,
+negative up.
+
+## The common thread
+
+All three controls obey the same rule: **change what the viewer sees,
+leave the sync the core generates as-is** (H-Size via read rate,
+H-Position via read address, V-Shift via a few lines of VSync delay).
+That is the entire reason the CRT stays locked while you adjust the
+picture live.
