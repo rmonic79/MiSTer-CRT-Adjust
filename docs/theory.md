@@ -2,18 +2,20 @@
 
 > This document explains the **CRT Adjust** engine. The module exposes three
 > controls — **H-Size**, **H-Position** and **V-Shift** — from one line buffer.
-> The common principle behind all three: **the picture *content* is
-> shifted/resized, the sync signals stay native.** That is why the CRT never
-> loses lock, no matter how far you push a control. The sections below explain
-> each in turn, starting with H-Size (the original engine).
+> The common principle behind all three: **the picture is repositioned through
+> the line buffer, and every part of the engine restarts on one shared line
+> reference.** That is why the CRT never loses lock, no matter how far you push
+> a control. The sections below explain each in turn, starting with H-Size (the
+> original engine).
 >
 > Numbers here use a DEC0-style core (`clk_video` 96 MHz / 6 MHz pixel), where
 > one pixel = 16 clock cycles. That ratio is **not universal**: the general
 > form is `base = clk_video / pixel`. Size everything from your own ratio.
 >
-> The same engine integrates two ways — inside `sys_top.v` (HDMI stays
-> bit-identical) or entirely core-side (no framework edits). For the core-side
-> variant see [core-side-integration.md](core-side-integration.md).
+> The same engine integrates two ways: core-side (recommended — no framework
+> edits, stays within the MiSTer-devel rules) or inside `sys_top.v` (keeps HDMI
+> bit-identical for H-Size, but edits framework code). For the core-side variant
+> see [core-side-integration.md](core-side-integration.md).
 
 ## The problem
 
@@ -59,9 +61,11 @@ land the width exactly where you want it, instead of the coarse jumps
 a whole-cycle divisor gives you. The hold time is still uniform for
 every pixel on the line, so there is **no shimmering**: the sampling is
 uniform along the line and stays uniform frame to frame because the
-accumulator resets on each rising **native** HSync.
+accumulator resets on each rise of the engine's line reference
+(`hs_ref_out` — see the H-Position section).
 
-Mathematically, with `hsize = k` (k = 0..7) and a 96 MHz `clk_vid`:
+Mathematically, taking a widening of `k` whole cycles on a 96 MHz
+`clk_vid` (the signed `hsize` counts quarters; `k = hsize/4`):
 
 ```
 core pixel period = clk_vid / 16     = 6.00 MHz       → 166.7 ns
@@ -89,28 +93,42 @@ produced, which breaks the "every pixel lasts exactly `16+hsize`
 clock cycles" property and re-introduces the very shimmering this
 module exists to avoid.
 
-In bypass mode (`hsize == 0`) the outputs are clocked at `pxl_cen`
-so the module behaves as a transparent passthrough.
+In bypass mode (`active == 0`) the outputs are clocked at `pxl_cen`
+so the module behaves as a transparent passthrough. Note that bypass
+is tied to the On/Off control, not to `hsize == 0`: with the module
+On the buffer stays live even at size 0, so H-Position and V-Shift
+still work.
 
-## Why the HSync reset matters
+## Why the line-reference reset matters
 
-The divisor counter for `pxl2_cen` must be reset to 0 on each rising
-edge of `hs_in` (HSync). Without this reset the counter free-runs
-and its phase relative to the start of the visible line drifts a
-little every frame, which the eye perceives as a small horizontal
-trembling. Resetting it on HSync locks the phase, and from there
-each scan line starts in exactly the same place.
+The accumulator generating `pxl2_cen` must be reset to 0 once per
+line. Without that reset it free-runs and its phase relative to the
+start of the visible line drifts a little every frame, which the eye
+perceives as a small horizontal trembling.
+
+It must be reset on the **same** edge the module's own engine uses —
+the reference the module publishes as `hs_ref_out` — and not on the
+raw `hs_in`. In `HPOS_CONTENTSHIFT` the two are the same signal, so
+either works; in `HPOS_SYNCSHIFT` they are not, and using the raw
+HSync leaves the read rate running out of phase with the read
+counter. That mismatch is what made the old upstream scheme drift
+and lose sync when shrinking.
 
 These two details are what make the module produce a clean,
 uniform resizing of the analog image. The rest of the H-Size design
 is a straightforward ping-pong line buffer.
 
-## H-Position — shift the content, not the sync
+## H-Position — two mechanisms, selected by `HPOS_MODE`
 
-H-Position slides the picture left/right. The naive way — moving the
-blanking/sync window — makes a CRT drop horizontal lock once you push
-it far enough. This module does it the safe way: it offsets only the
-**read address** into the line buffer,
+H-Position slides the picture left/right. There are two ways to do it and
+**both are in the module**; the `HPOS_MODE` parameter picks which one is
+built. They do not differ in whether they desync (neither does) — they
+differ in **how they fail at the extremes**, which is why the right one
+depends on the game's geometry.
+
+### `HPOS_CONTENTSHIFT` (1) — shift the content
+
+Offsets only the **read address** into the line buffer,
 
 ```
 rd_addr = rdcnt - hoffset
@@ -118,9 +136,40 @@ rd_addr = rdcnt - hoffset
 
 and shifts the active-window compare (`pass_q`) by the same `hoffset`.
 The visible content moves; **`hs_out` is never touched**, so it stays
-byte-for-byte the native HSync. The CRT sees an unchanged sync and a
-moved picture → the image slides with **no horizontal desync at any
-offset**. Positive `hoffset` moves right, negative moves left.
+byte-for-byte the native HSync, and the whole engine keeps restarting on
+that native edge — which is why this mode stays rock-solid even while
+H-Size is *shrinking* the picture.
+
+Its limit: the content can only move as far as the line buffer window
+allows. On a **narrow game anchored to one side** of the line (say 256
+active pixels with a wide asymmetric back porch), pushing toward the
+short-margin side walks the content out of the window and a **black
+block** appears at that edge.
+
+### `HPOS_SYNCSHIFT` (0) — shift the sync
+
+The original mechanism, kept. A line-length shift register delays
+`hs_in` by N pixels and that **shifted HSync becomes the output sync**;
+the content stays where it natively is. Nothing has to move inside a
+window, so there is no black block — this is the mode for narrow,
+side-anchored games.
+
+The subtlety is phase. In this mode the module restarts its *entire*
+engine — write pointer, bank flip, blanking capture, read counter — on
+the **shifted** HSync, and exposes that reference as `hs_ref_out`:
+
+```
+hs_read_ref = (HPOS_MODE == HPOS_SYNCSHIFT) ? hs_shifted : hs_in;
+```
+
+The external read-rate generator (`pxl2_cen`) **must** reset on that same
+`hs_ref_out` edge. When all three restart together the enlarged content
+stays aligned with the read window. Resetting the read rate on the *raw*
+HSync while the engine restarts on the shifted one is precisely the phase
+mismatch that made the old upstream scheme drift and desync when
+shrinking.
+
+In both modes: positive `hoffset` moves the picture right, negative left.
 
 ## V-Shift — delay the sync a few lines
 

@@ -10,7 +10,7 @@
 //  buffer provides THREE controls:
 //
 //      - H-Size     : horizontal stretch / squeeze (bidirectional, integer)
-//      - H-Position : horizontal content shift (does NOT move the sync)
+//      - H-Position : horizontal slide — two mechanisms, see HPOS_MODE below
 //      - V-Shift    : vertical line shift
 //
 //  ─── Why it never desyncs the CRT ──────────────────────────────────────────
@@ -39,9 +39,11 @@
 //  ─── Required external signals ─────────────────────────────────────────────
 //  pxl_cen   : the core's pixel clock enable (write rate, e.g. 6 MHz pulse
 //              on a 96 MHz clk).
-//  pxl2_cen  : the DAC read clock enable, SLOWER than pxl_cen by an integer
-//              divisor (base+hsize) of clk, generated externally for phase
-//              alignment with HSync (see examples/core_side_snippet.v).
+//  pxl2_cen  : the DAC read clock enable, generated externally as
+//              (base + hsize) quarter-cycles of clk. IMPORTANT: reset its
+//              generator on the RISE of `hs_ref_out` (NOT on the raw HSync), so
+//              the read rate and the module's internal read counter restart on
+//              the same edge in BOTH HPOS modes. See core_side_snippet.v.
 //  active    : ON/OFF. 0 = pure bypass (native passthrough). 1 = module live,
 //              so H-Size / H-Position / V-Shift work even at value 0.
 //  hsize     : signed 5-bit, OSD-controlled size factor (bidirectional).
@@ -49,9 +51,7 @@
 //              hsize = 0 → no scaling (H-Position / V-Shift still apply if On)
 //              hsize > 0 → slower read → WIDER pixels (enlarge)
 //              hsize < 0 → faster read → NARROWER pixels (shrink)
-//              (a core that prefers the opposite polarity can just negate the
-//               OSD value in its glue before connecting.)
-//  hoffset   : signed 9-bit, H-Position — shifts the CONTENT, not the sync.
+//  hoffset   : signed 9-bit, H-Position — mechanism selected by HPOS_MODE.
 //  voffset   : signed 6-bit, V-Shift — shifts VSync by N lines.
 //
 //  ─── License ───────────────────────────────────────────────────────────────
@@ -59,7 +59,52 @@
 //  Distributed under GNU GPL v3 or later.
 //============================================================================
 
-module crt_adjust #(parameter VTOTAL = 263)
+// ----------------------------------------------------------------------------
+//  HPOS_MODE — how the H-Position control moves the image horizontally.
+//
+//  Two independent mechanisms, pick one per core at compile time. Both are
+//  driven by the same OSD "H-Position" value (`hoffset`); the difference is
+//  WHAT gets moved.
+//
+//  Both generations of H-Position live in this one file; the parameter picks
+//  which one is built. Neither desyncs the CRT — but they fail differently at
+//  the extremes, so the right choice depends on the GAME's geometry.
+//
+//    HPOS_CONTENTSHIFT (1) — the newer mechanism.
+//        Shifts the CONTENT inside the line buffer; HSync out stays byte-for-byte
+//        native. The whole engine (write + read) keeps restarting on the native
+//        HSync, so it stays rock-solid even while H-Size SHRINKS the image.
+//        Downside: on a NARROW game whose active area is anchored to one side of
+//        the line (large asymmetric blanking), pushing the content toward the
+//        short-margin side runs it out of the buffer window and a black block
+//        appears at the screen edge.
+//        USE FOR: wide / centered games (e.g. 320px active on a 384px line).
+//
+//    HPOS_SYNCSHIFT (0) — the original upstream mechanism, kept.
+//        Shifts the HSYNC out by N pixels through a line-length shift register;
+//        the content stays anchored natively. The picture slides on the CRT with
+//        no buffer window to fall out of -> no black block on narrow anchored
+//        games. In this mode the ENTIRE engine (write side, read counter) and the
+//        external read-rate generator all restart on the SHIFTED HSync, exposed
+//        as `hs_ref_out`. That shared reference is what keeps everything in phase;
+//        it is also why the glue must reset pxl2_cen on `hs_ref_out` and not on
+//        the raw HSync (doing the latter is what desynced the old upstream
+//        scheme when shrinking).
+//        USE FOR: narrow / side-anchored games (e.g. 256px active with a wide
+//        asymmetric H back-porch).
+// ----------------------------------------------------------------------------
+// Guarded so that including both crt_adjust.sv and crt_adjust_sys.sv in the
+// same project does not raise a macro-redefinition warning.
+`ifndef HPOS_SYNCSHIFT
+`define HPOS_SYNCSHIFT    0
+`define HPOS_CONTENTSHIFT 1
+`endif
+
+module crt_adjust #(
+    parameter VTOTAL   = 263,
+    parameter HTOTAL   = 384,               // line length in pixels (for the HSync shreg)
+    parameter HPOS_MODE = `HPOS_CONTENTSHIFT // see HPOS_MODE block above
+)
 (
     input              clk,
     input              pxl_cen,      // write clock enable (core pixel rate)
@@ -70,9 +115,11 @@ module crt_adjust #(parameter VTOTAL = 263)
                                      // anche se i loro valori sono 0).
 
     input  signed [4:0] hsize,       // 0 = nessuna scala, !=0 = enlarge/shrink
-    input  signed [8:0] hoffset,     // sposta il CONTENUTO orizzontale (non il sync):
-                                     // >0 = a DESTRA, <0 = a SINISTRA.
-                                     // Non tocca hs_out -> nessun desync CRT.
+    input  signed [8:0] hoffset,     // H-Position value from the OSD.
+                                     // HPOS_CONTENTSHIFT: shifts the CONTENT in the
+                                     //   line buffer (>0 right, <0 left), sync native.
+                                     // HPOS_SYNCSHIFT: delays HSync by N pixels, content
+                                     //   stays native (>0 right, <0 left). See HPOS_MODE.
     input  signed [5:0] voffset,     // V-Shift: sposta il VSync di N righe (signed).
                                      // >0 = giu`, <0 = su. Verticale non desincronizza.
 
@@ -90,7 +137,12 @@ module crt_adjust #(parameter VTOTAL = 263)
     output reg         hs_out,
     output reg         vs_out,
     output reg         hb_out,
-    output reg         vb_out
+    output reg         vb_out,
+    // Shifted HSync reference (HPOS_SYNCSHIFT): the glue must reset its read-rate
+    // generator (pxl2_cen) on the RISE of this signal so the read-rate and the
+    // module's read counter restart on the same edge (like the upstream scheme).
+    // In HPOS_CONTENTSHIFT it equals the native HSync.
+    output wire        hs_ref_out
 );
 
     localparam integer AW = 10;  // 1024 samples per line (ping-pong banks)
@@ -118,7 +170,44 @@ module crt_adjust #(parameter VTOTAL = 263)
         hs_in_d  <= hs_in;
     end
 
-    wire hs_rise_in = pxl_cen && (hs_in & ~hs_in_d);
+    // Native HSync rise (used only for the shift register that produces the
+    // shifted reference below).
+    wire hs_rise_native = pxl_cen && (hs_in & ~hs_in_d);
+
+    // ------------------------------------------------------------------
+    //  H-Shift shift register (HPOS_SYNCSHIFT). Delays HSync by N pixels
+    //  (hoffset signed). Declared BEFORE the read side because in
+    //  HPOS_SYNCSHIFT the read counter (rdcnt) resets on this SHIFTED HSync,
+    //  exactly like the reference upstream scheme (analog_hsize + h-shift):
+    //  there the read divisor and the read counter both restart on the shifted
+    //  HSync, so the enlarged content stays aligned with the read window and
+    //  never runs off into the right-edge black. Clocked @ pxl_cen (native px).
+    //  hoffset >0 = right (delay HSync), <0 = left (advance = HTOTAL-|N| tap).
+    // ------------------------------------------------------------------
+    wire signed [9:0] hshift_tap = hoffset[8]
+        ? (10'(HTOTAL) + {{1{hoffset[8]}}, hoffset})  // negativo -> HTOTAL - |N|
+        : {1'd0, hoffset};                            // positivo -> N
+    reg [HTOTAL-1:0] hsync_pix_shreg;
+    initial hsync_pix_shreg = 0;
+    always @(posedge clk) if (pxl_cen)
+        hsync_pix_shreg <= {hsync_pix_shreg[HTOTAL-2:0], hs_in};
+    reg hs_shifted;
+    initial hs_shifted = 0;
+    always @(posedge clk) if (pxl_cen)
+        hs_shifted <= (hshift_tap == 10'd0) ? hs_in : hsync_pix_shreg[hshift_tap - 10'd1];
+
+    // HSync reference for the WHOLE line-buffer engine: the shifted HSync in
+    // HPOS_SYNCSHIFT, the native HSync otherwise. Like the reference upstream
+    // scheme (analog_hsize fed the already-shifted HSync), BOTH the write side
+    // (wrp/bank/hb0/hb1 capture) and the read side restart on this same edge, so
+    // write and read stay on the same bank/phase and the enlarged content is not
+    // disaligned at the right edge.
+    wire hs_read_ref = (HPOS_MODE == `HPOS_SYNCSHIFT) ? hs_shifted : hs_in;
+    assign hs_ref_out = hs_read_ref;   // exposed so the glue aligns pxl2_cen to it
+    reg  hs_ref_d1;
+    initial hs_ref_d1 = 0;
+    always @(posedge clk) if (pxl_cen) hs_ref_d1 <= hs_read_ref;
+    wire hs_rise_in = pxl_cen && (hs_read_ref & ~hs_ref_d1);
 
     // ------------------------------------------------------------------
     //  Linebuffer ping-pong (24-bit RGB, single M10K, two banks).
@@ -179,8 +268,8 @@ module crt_adjust #(parameter VTOTAL = 263)
     end
 
     always @(posedge clk) begin
-        hs_in_d2 <= hs_in;
-        if (hs_in & ~hs_in_d2)        hs_rise_pending <= 1'b1;
+        hs_in_d2 <= hs_read_ref;
+        if (hs_read_ref & ~hs_in_d2)  hs_rise_pending <= 1'b1;
         else if (pxl2_cen)            hs_rise_pending <= 1'b0;
     end
 
@@ -225,10 +314,16 @@ module crt_adjust #(parameter VTOTAL = 263)
     // hoffset (signed) sposta la finestra attiva: >0 = contenuto a DESTRA, <0 a
     // SINISTRA. rd_addr compensa per leggere il pixel sorgente giusto. hs_out NON
     // e' toccato -> HSync intatto -> no desync, qualunque sia l'entita' del shift.
+    //
+    // In HPOS_SYNCSHIFT the horizontal offset is applied to HSync out (see below),
+    // NOT to the read window: the content stays anchored natively, so the read
+    // offset is forced to 0 here and hb1/hb0 keep gating the native active area.
+    wire signed [AW+1:0] hoff_s  = (HPOS_MODE == `HPOS_CONTENTSHIFT)
+                                   ? $signed(hoffset)
+                                   : {(AW+2){1'b0}};
     wire signed [AW+1:0] rdcnt_s = $signed({2'b0, rdcnt});
     wire signed [AW+1:0] hb1_s   = $signed({2'b0, hb1});
     wire signed [AW+1:0] hb0_s   = $signed({2'b0, hb0});
-    wire signed [AW+1:0] hoff_s  = $signed(hoffset);
     wire [AW-1:0] rd_addr = (rdcnt_s - hoff_s);
     always @(posedge clk) if (pxl2_cen) begin
         rd_data <= mem[{~bank, rd_addr[AW-2:0]}];
@@ -251,6 +346,10 @@ module crt_adjust #(parameter VTOTAL = 263)
     initial vs_shifted = 0;
     always @(posedge clk) if (hs_rise_in)
         vs_shifted <= (vshift_tap == 9'd0) ? vs_in : vsync_line_shreg[vshift_tap - 9'd1];
+
+    // HSync emitted by the module: shifted only in HPOS_SYNCSHIFT, else native.
+    // (hsync_pix_shreg / hs_shifted are computed above, before the read side.)
+    wire hs_pos_out = (HPOS_MODE == `HPOS_SYNCSHIFT) ? hs_shifted : hs_in_q;
 
     // ------------------------------------------------------------------
     //  Output mux. CRITICAL: when stretch is active, outputs MUST be
@@ -293,7 +392,7 @@ module crt_adjust #(parameter VTOTAL = 263)
                     b_out <= 8'd0;
                 end
                 hb_out <= ~pass_q;
-                hs_out <= hs_in_q;
+                hs_out <= hs_pos_out;   // HPOS_SYNCSHIFT -> shifted HSync, else native
                 vs_out <= vs_shifted;   // V-Shift interno (VSync shiftato)
                 vb_out <= vb_in_q;
             end

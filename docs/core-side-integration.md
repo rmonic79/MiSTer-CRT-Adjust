@@ -1,19 +1,21 @@
 # Core-side integration (no `sys_top` edits)
 
-The sys-side module (`crt_adjust_sys.sv`) inserts CRT Adjust inside `sys_top.v`
-at the DAC stage — cleanest for HDMI (stays bit-identical), but it edits
-framework code that is vendored, clobbered on updates, and off-limits under many
-project rules.
+This is the **recommended** integration: it touches no framework code, so it
+does not break the MiSTer-devel rule against modifying `sys/`, and it is what
+released cores ship. The sys-side module (`crt_adjust_sys.sv`) keeps HDMI
+bit-identical but edits `sys_top.v` (vendored, clobbered on updates, outside the
+rules) — use it only when a bit-identical HDMI picture is the priority.
 
-This variant (`crt_adjust.sv` + `examples/core_side_snippet.v`) runs the **same
-engine entirely from the core's `emu` wrapper**, at the video-output boundary,
-with **zero `sys_top` changes**. Validated on Seibu D-Con (GundamSD) and Data
+This variant (`crt_adjust.sv` + `examples/core_side_snippet.v`) runs the **whole
+engine from the core's `emu` wrapper**, at the video-output boundary, with
+**zero `sys_top` changes**. Validated on Seibu D-Con (GundamSD, CONTENTSHIFT), Legionnaire / Heated Barrel (SYNCSHIFT) and Data
 East DEC0 cores (ActFancer, Trio The Punch) on a real 15 kHz CRT.
 
 The key difference from the old H-Size-only module: **H-Position and V-Shift are
 now inside the module.** You no longer shift the sync upstream by hand — you
 decode the OSD values, generate the read clock-enable, and hand the module the
-**native** sync. The module shifts the content and leaves the sync alone.
+**native** sync. How H-Position then moves the picture (content or sync) is a
+compile-time choice, `HPOS_MODE`, made per game — see below.
 
 ---
 
@@ -44,20 +46,38 @@ leave CRT Adjust Off for untouched HDMI.
 
 ---
 
-## The three controls, all content-shift
+## The three controls
 
-The rule the whole design follows: **change what the viewer sees, leave the
-sync the core generates as-is.** That is why the CRT never desyncs.
+The rule the design follows: **change what the viewer sees, and keep every part
+of the engine restarting on the same line reference.** That is why the CRT never
+desyncs — in either `HPOS_MODE`.
 
 - **H-Size** — the read clock-enable (`pxl2_cen`) runs at a different rate than
   the write (`pxl_cen`), stepped in quarter cycles. Slower read = wider, faster
   = narrower. `hs_out` is never touched.
-- **H-Position** — the module offsets its own read address
-  (`rd_addr = rdcnt - hoffset`) and the active-window compare. Content slides;
-  sync stays native. **No upstream sync shifting needed** — just pass `hoffset`
-  in.
+- **H-Position** — two mechanisms, selected at compile time by the `HPOS_MODE`
+  parameter. `HPOS_CONTENTSHIFT` offsets the module's own read address
+  (`rd_addr = rdcnt - hoffset`) and the active-window compare, so the content
+  slides and the sync stays native — the right choice on wide/centered games,
+  and the one that holds up while H-Size shrinks. `HPOS_SYNCSHIFT` instead
+  delays the output HSync by N pixels and leaves the content anchored — the
+  right choice on narrow/side-anchored games, where content-shifting would run
+  the picture out of the buffer window and show a black block at the edge.
+  Either way you just pass `hoffset` in; **no upstream sync shifting needed**.
+  See the `HPOS_MODE` block at the top of `crt_adjust.sv`.
 - **V-Shift** — a per-line shift register inside the module delays `VSync` by N
   lines. Vertical tolerance on a CRT is wide, so this never desyncs.
+
+---
+
+### The one wiring rule
+
+Whichever `HPOS_MODE` you build, reset your read-rate generator (`pxl2_cen`) on
+the rise of the module's **`hs_ref_out`**, never on the raw HSync. That output is
+the reference the module's own engine restarts on (shifted in `HPOS_SYNCSHIFT`,
+native otherwise); sharing it keeps write side, read counter and read rate in
+phase. Getting this wrong is what desynced the old upstream scheme when
+shrinking.
 
 ---
 
@@ -111,13 +131,13 @@ pulses).
 
 ## vs. the sys-side insertion
 
-| | sys-side (`crt_adjust_sys.sv`) | core-side (`crt_adjust.sv`) |
+| | core-side (`crt_adjust.sv`) — recommended | sys-side (`crt_adjust_sys.sv`) |
 |---|---|---|
-| Placement | DAC stage in `sys_top.v` | core video-output boundary |
-| Framework edits | yes (`sys_top.v`) | **none** |
-| HDMI | bit-identical | follows the adjust |
-| OSD | naturally on the adjusted stream | needs the `vb_in` + `de_osd` glue |
-| Best when | you can edit `sys_top` | `sys_top` is off-limits |
+| Placement | core video-output boundary | DAC stage in `sys_top.v` |
+| Framework edits | **none** (rule-compliant) | yes (`sys_top.v`, outside the rules) |
+| HDMI | follows the adjust | H-Size stays off it; H-Pos/V-Shift reach it |
+| OSD | needs the `vb_in` + `de_osd` glue | naturally on the adjusted stream |
+| Best when | the normal case | you specifically need HDMI bit-identical |
 
 See `examples/core_side_snippet.v` for the complete glue. The *shape* transfers
 to any MiSTer arcade core; the exact wiring (clock ratio, mixer/overlay names)

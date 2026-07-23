@@ -10,7 +10,8 @@
 //  the module — you no longer shift the sync upstream by hand. You just decode
 //  the OSD values, generate the read clock-enable, and wire the native sync in.
 //
-//  Validated on Seibu D-Con (GundamSD) and Data East DEC0 cores driving a real
+//  Validated on Seibu D-Con (GundamSD, CONTENTSHIFT), Seibu Legionnaire /
+//  Heated Barrel (SYNCSHIFT) and Data East DEC0 cores driving a real
 //  15 kHz CRT. clk_sys = 96 MHz, pixel = 6 MHz -> base = 64 quarters (= 16 whole
 //  cycles). Size the read period from your own clk_video/pixel ratio.
 //============================================================================
@@ -56,46 +57,64 @@ reg signed [5:0] vshift_off;
 always @(posedge clk_sys) if (ce_pix) vshift_off <= $signed(status[78:74]);
 
 
-// ─── 3. Read clock-enable: quarter-cycle stepped, reset on NATIVE HSync ─────
+// ─── 3. Read clock-enable: quarter-cycle stepped, reset on hs_ref_out ───────
 //  Read one pixel every (base + hsize) QUARTERS of clk_sys. base = 64 quarters
 //  (= 16 whole cycles) here. Quarter stepping makes each H-Size step ~1.5%.
-//  Reset the accumulator on the NATIVE HSync rise -> deterministic phase/line.
-reg HSync_d;
-always @(posedge clk_sys) HSync_d <= HSync;
-wire native_hs_rise = HSync & ~HSync_d;
+//
+//  CRITICAL: reset the accumulator on the rise of the module's hs_ref_out, NOT
+//  on the raw HSync. hs_ref_out is the HSync reference the module's own engine
+//  restarts on (the SHIFTED HSync in HPOS_SYNCSHIFT, the native one otherwise).
+//  Sharing that edge is what keeps write side, read counter and read rate in
+//  phase; resetting on the raw HSync is what desynced the old upstream scheme
+//  when shrinking.
+wire hs_ref;                      // from the module (registered -> no comb loop)
+reg  hs_ref_d;
+always @(posedge clk_sys) hs_ref_d <= hs_ref;
+wire hs_ref_rise = hs_ref & ~hs_ref_d;
 
 wire [7:0] rd_period = 8'd64 + {{3{hsize_s[4]}}, hsize_s};  // -16..+15 -> 48..79
 reg  [7:0] rd_acc;
 wire rd_tick = (rd_acc + 8'd4) >= {1'b0, rd_period};
 always @(posedge clk_sys) begin
-    if      (native_hs_rise) rd_acc <= 8'd0;
-    else if (rd_tick)        rd_acc <= rd_acc + 8'd4 - {1'b0, rd_period};
-    else                     rd_acc <= rd_acc + 8'd4;
+    if      (hs_ref_rise) rd_acc <= 8'd0;
+    else if (rd_tick)     rd_acc <= rd_acc + 8'd4 - {1'b0, rd_period};
+    else                  rd_acc <= rd_acc + 8'd4;
 end
 wire rd_ce = crt_on ? rd_tick : ce_pix;
 
 
-// ─── 4. Instantiate crt_adjust — feed it the NATIVE sync ───────────────────
-//  hs_in/vs_in are the core's raw HSync/VSync. The module shifts CONTENT only,
-//  so passing native sync in is what keeps the CRT locked.
+// ─── 4. Instantiate crt_adjust — pick HPOS_MODE for THIS game ──────────────
+//  HPOS_MODE = 1 (CONTENTSHIFT): shifts the content, HSync stays native.
+//      Use on WIDE / CENTERED games (e.g. 320px active on a 384px line).
+//  HPOS_MODE = 0 (SYNCSHIFT): shifts the HSync, content stays anchored.
+//      Use on NARROW / SIDE-ANCHORED games (e.g. 256px active with a wide
+//      asymmetric back porch), where CONTENTSHIFT would push the content out
+//      of the buffer window and show a black block at the edge.
+//  hs_in/vs_in are always the core's RAW HSync/VSync — the module derives its
+//  own reference (hs_ref_out) from them.
 wire [7:0] str_r, str_g, str_b;
 wire       str_hs, str_vs, str_hb, str_vb;
-crt_adjust #(.VTOTAL(V_TOTAL)) u_crt_adjust (
+crt_adjust #(
+    .VTOTAL   (V_TOTAL),
+    .HTOTAL   (H_TOTAL),        // sizes the HSync shreg used by SYNCSHIFT
+    .HPOS_MODE(1)               // 1 = CONTENTSHIFT (wide), 0 = SYNCSHIFT (narrow)
+) u_crt_adjust (
     .clk      (clk_sys),
     .pxl_cen  (ce_pix),          // write rate (native pixel)
     .pxl2_cen (rd_ce),           // read rate (H-Size)
     .active   (crt_on),
     .hsize    (hsize_s),
-    .hoffset  (hpos_off),        // H-Position (content shift, sync untouched)
+    .hoffset  (hpos_off),        // H-Position (mechanism per HPOS_MODE)
     .voffset  (vshift_off),      // V-Shift (VSync delayed N lines)
     .r_in     (av_r), .g_in (av_g), .b_in (av_b),
-    .hs_in    (HSync),           // NATIVE HSync -> no desync
+    .hs_in    (HSync),           // NATIVE HSync in
     .vs_in    (VSync),
     .hb_in    (HBlank | VBlank),
     .vb_in    (VBlank),
     .r_out    (str_r), .g_out (str_g), .b_out (str_b),
     .hs_out   (str_hs), .vs_out (str_vs),
-    .hb_out   (str_hb), .vb_out (str_vb)
+    .hb_out   (str_hb), .vb_out (str_vb),
+    .hs_ref_out (hs_ref)         // -> resets the read-rate generator (step 3)
 );
 
 
