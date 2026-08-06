@@ -48,9 +48,18 @@ timing parameters, follows NTSC/PAL switches by itself), needs a
 clk-to-pixel ratio ≥ 8, and costs ~`RING_LINES × LINE_PX × 24` bit of BRAM
 (46 lines ≈ 17 M10K). On large enlargements Cabinet mode micro-delays the
 output VSync so the extra rows escape the vertical retrace and the picture
-recenters itself. The physics, the design decisions and the dead ends worth
-not retrying are documented in [`docs/v-size-design.md`](docs/v-size-design.md)
-and [`docs/v-size-desync-roadmap.md`](docs/v-size-desync-roadmap.md).
+recenters itself.
+
+**Start here to integrate it:**
+* [`docs/vsize-integration.md`](docs/vsize-integration.md) — the complete
+  integration guide: chain placement, requirements, ports, OSD strings,
+  decode, instantiation, the `vb` rule, bring-up checklist
+* [`examples/vsize_integration_snippet.v`](examples/vsize_integration_snippet.v)
+  — the wiring fragments, verbatim from the shipping NeoGeo integration
+
+The physics, the design decisions and the dead ends worth not retrying are
+documented in [`docs/v-size-design.md`](docs/v-size-design.md) and
+[`docs/v-size-desync-roadmap.md`](docs/v-size-desync-roadmap.md).
 
 > **Recommended: core-side** (`crt_adjust.sv`). It touches no framework code, so
 > it does not break the MiSTer-devel rule against modifying `sys/` — which is why
@@ -367,15 +376,20 @@ MiSTer-CRT-Adjust/
 ├── rtl/
 │   ├── crt_adjust.sv          CRT Adjust — core-side (recommended)
 │   ├── crt_adjust_sys.sv      CRT Adjust — sys-side (HDMI bit-identical)
+│   ├── crt_vsize.sv           CRT V-Size — vertical, PVM/Cabinet (experimental)
 │   └── old/
 │       ├── analog_hsize.sv        legacy H-Size only — sys-side
 │       └── analog_hsize_emu.sv    legacy H-Size only — core-side
 ├── docs/
 │   ├── theory.md                  Why and how it works
-│   └── core-side-integration.md   Core-side integration (no sys_top edits)
+│   ├── core-side-integration.md   Core-side integration (no sys_top edits)
+│   ├── vsize-integration.md       V-Size integration guide (start here)
+│   ├── v-size-design.md           V-Size design decisions & physics
+│   └── v-size-desync-roadmap.md   V-Size anti-desync research notes
 └── examples/
     ├── core_side_snippet.v        Reference glue for core-side (your core .sv)
-    └── sys_top_snippet.v          Reference glue for sys-side (sys_top.v)
+    ├── sys_top_snippet.v          Reference glue for sys-side (sys_top.v)
+    └── vsize_integration_snippet.v  V-Size chain glue (from NeoGeo Streamer)
 ```
 
 ---
