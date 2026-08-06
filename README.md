@@ -20,6 +20,38 @@ with three controls driven from one always-on line buffer:
 The old H-Size-only modules are still in [`rtl/old/`](rtl/old/) for anyone who
 wants just that — but new cores should use **CRT Adjust**.
 
+---
+
+## NEW · CRT V-Size (experimental) — vertical stretch / shrink
+
+[`rtl/crt_vsize.sv`](rtl/crt_vsize.sv) is a **separate, self-contained
+companion stage** — existing `crt_adjust` integrations are not affected in
+any way. First shipped in
+[NeoGeo_MiSTer_Streamer](https://github.com/rmonic79/NeoGeo_MiSTer_Streamer),
+where it is HW-validated on an arcade cabinet chassis, a 9" PVM and a Barco
+RGB monitor; it stays marked *experimental* while community feedback on more
+chassis comes in.
+
+Changing the vertical size of a CRT picture always has a price — the module
+offers **two exclusive modes** that pay it in different currencies:
+
+| | **PVM mode** — line retimer | **Cabinet mode** — photometric |
+|---|---|---|
+| Mechanism | retimes the total line count per frame: every line stays **unique** — zero artifacts, the vertical twin of H-Size | timing stays **100% native**: each source line's light is redistributed onto the fixed scanline grid (gamma-correct 2-tap in linear light, energy-preserving) — what the chassis V-size pot does, computed |
+| HSync | moves ~0.4 % per line | untouched to the Hz — **losing sync is physically impossible** |
+| Use on | broadcast monitors with a wide H-lock (PVM/BVM, Barco RGB) | arcade cabinet chassis, consumer TVs, anything that refuses frequency changes |
+| Trade-off | the monitor must follow the frequency | a very slight, uniform vertical softness — no banding, no doubled lines, no shimmer |
+
+Integration notes: it sits **before** `crt_adjust` (`native stream →
+crt_vsize → crt_adjust → OSD`), is fully **self-measuring** (no per-core
+timing parameters, follows NTSC/PAL switches by itself), needs a
+clk-to-pixel ratio ≥ 8, and costs ~`RING_LINES × LINE_PX × 24` bit of BRAM
+(46 lines ≈ 17 M10K). On large enlargements Cabinet mode micro-delays the
+output VSync so the extra rows escape the vertical retrace and the picture
+recenters itself. The physics, the design decisions and the dead ends worth
+not retrying are documented in [`docs/v-size-design.md`](docs/v-size-design.md)
+and [`docs/v-size-desync-roadmap.md`](docs/v-size-desync-roadmap.md).
+
 > **Recommended: core-side** (`crt_adjust.sv`). It touches no framework code, so
 > it does not break the MiSTer-devel rule against modifying `sys/` — which is why
 > released cores ship it. HDMI follows the adjust while CRT Adjust is On (leave
