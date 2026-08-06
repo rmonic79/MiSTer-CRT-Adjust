@@ -146,6 +146,26 @@ upstreamed and gets clobbered when you resync `sys/`.
 Functionally the engine is identical: same three controls, same `HPOS_MODE`
 choice — the difference is only where you insert it and what that does to HDMI.
 
+> **Field note (2026-08-05, code-verified on the current MiSTer framework —
+> NeoGeo_MiSTer sys, first sys-side integration in
+> [NeoGeo_MiSTer_Streamer](https://github.com/rmonic79/NeoGeo_MiSTer_Streamer)):**
+> the HDMI scaler taps the slot-line stream **above** the insertion point
+> (`ce_hpix/hr_out/hhs_fix/hvs_fix/hde_emu` are assigned from `vga_*_sl`), so
+> **all three controls — H-Size, H-Position AND V-Shift — stay on the analog
+> branch only**: the module's shifted syncs never reach the HDMI scaler. The
+> "H-Pos/V-Shift reach HDMI" caveat above does not apply to this framework
+> version. The only HDMI mode that follows the adjust is `direct_video`
+> (it taps post-OSD), which is itself a CRT-style output, so that is the
+> desired behavior. Two integration rules confirmed:
+> 1. `vb_in` MUST be the core's TRUE vertical blank, forwarded from the emu
+>    (e.g. an added `CRT_VBL` port). Feeding the combined blank (`~vga_de_sl`)
+>    like the legacy `analog_hsize` glue did gives a BLACK SCREEN with this
+>    engine: at every HSync rise the combined blank is 1, so `vb_active`
+>    latches 1 on every line and `pass_q` never opens.
+> 2. Gate `active` off in the core when the scandoubler is enabled — the
+>    read-rate base assumes the native (15 kHz) pixel-CE ratio.
+> HW test pending; engine is line-for-line the HW-proven core-side one.
+
 > **Legacy:** the original stretch-only modules live in
 > [`rtl/old/`](rtl/old/) — `analog_hsize.sv` (sys-side) and
 > `analog_hsize_emu.sv` (core-side). They still work; they just don't have
