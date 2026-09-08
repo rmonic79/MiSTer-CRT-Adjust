@@ -116,7 +116,10 @@
 module crt_adjust_sys #(
     parameter VTOTAL   = 263,
     parameter HTOTAL   = 384,               // line length in pixels (for the HSync shreg)
-    parameter HPOS_MODE = `HPOS_CONTENTSHIFT // see HPOS_MODE block above
+    parameter HPOS_MODE = `HPOS_CONTENTSHIFT, // see HPOS_MODE block above
+    parameter AW        = 10                 // linebuffer: 2**AW samples,
+                                             // half per ping-pong bank. Raise it
+                                             // if HTOTAL > 2**(AW-1).
 )
 (
     input              clk,
@@ -157,8 +160,6 @@ module crt_adjust_sys #(
     // In HPOS_CONTENTSHIFT it equals the native HSync.
     output wire        hs_ref_out
 );
-
-    localparam integer AW = 10;  // 1024 samples per line (ping-pong banks)
 
     // ------------------------------------------------------------------
     //  Input pipeline @ pxl_cen (for latency matching in bypass mode)
